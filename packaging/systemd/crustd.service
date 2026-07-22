@@ -1,0 +1,19 @@
+[Unit]
+Description=crustd - tiered presence detection for Bread
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/crustd
+Restart=on-failure
+RestartSec=5
+
+# Power/hardening: no network, no writes outside its own state dir, camera access only.
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/crustd %h/.config/crustd
+NoNewPrivileges=true
+SupplementaryGroups=video render
+
+[Install]
+WantedBy=default.target
