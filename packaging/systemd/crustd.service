@@ -1,6 +1,7 @@
 [Unit]
 Description=crustd - tiered presence detection for Bread
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -13,7 +14,26 @@ PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=%h/.local/share/crustd %h/.config/crustd
 NoNewPrivileges=true
-SupplementaryGroups=video render
+SupplementaryGroups=video
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+UMask=0077
+# ProtectProc is deliberately omitted here rather than enabled unverified: it
+# restricts visibility into *other* processes' /proc/<pid> entries (not /proc/acpi
+# itself, which src/lid.rs reads), so it likely doesn't conflict with lid detection
+# — but that's an inference, not a test against real hardware/kernel behavior. Worth
+# enabling (e.g. ProtectProc=invisible) once someone can confirm `bread lid` still
+# works with it on target hardware.
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

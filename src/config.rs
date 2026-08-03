@@ -65,6 +65,11 @@ pub struct MotionConfig {
     pub diff_threshold: u8,
     /// Minimum count of changed pixels (out of 320x180) to call it motion.
     pub blob_min_pixels: usize,
+    /// Minimum time between IR acquisition bursts while Absent and RGB motion is
+    /// present but no face has been confirmed yet. Without a floor here, sustained
+    /// non-face motion (a TV, a pet, trees through a window) would retrigger a burst
+    /// on every `active_poll_ms` tick indefinitely.
+    pub ir_burst_cooldown_ms: u64,
 }
 
 impl Default for MotionConfig {
@@ -79,6 +84,7 @@ impl Default for MotionConfig {
             input_idle_timeout_ms: 20_000,
             diff_threshold: 24,
             blob_min_pixels: 200,
+            ir_burst_cooldown_ms: 3_000,
         }
     }
 }
@@ -155,11 +161,61 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &PathBuf) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+        let cfg = if !path.exists() {
+            Self::default()
+        } else {
+            let raw = std::fs::read_to_string(path)?;
+            toml::from_str(&raw)?
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Rejects config values that would otherwise produce a permanent hot-spin poll
+    /// loop or a presence state that can never change (e.g. a zero poll interval, or
+    /// a confidence floor of 0.0 that makes every frame "a face"). Called once after
+    /// load so a bad config fails fast with a clear message instead of the daemon
+    /// running in a silently broken mode.
+    pub fn validate(&self) -> Result<()> {
+        const MIN_POLL_MS: u64 = 50;
+
+        let polls = [
+            ("motion.idle_poll_ms", self.motion.idle_poll_ms),
+            ("motion.active_poll_ms", self.motion.active_poll_ms),
+            ("motion.max_idle_poll_ms", self.motion.max_idle_poll_ms),
+            ("motion.present_poll_ms", self.motion.present_poll_ms),
+            ("motion.present_stillness_timeout_ms", self.motion.present_stillness_timeout_ms),
+            ("motion.present_retry_after_miss_ms", self.motion.present_retry_after_miss_ms),
+            ("motion.ir_burst_cooldown_ms", self.motion.ir_burst_cooldown_ms),
+        ];
+        for (name, value) in polls {
+            if value < MIN_POLL_MS {
+                anyhow::bail!("{name} must be at least {MIN_POLL_MS}ms, got {value}ms");
+            }
         }
-        let raw = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&raw)?)
+
+        if self.presence.ir_burst_frames == 0 {
+            anyhow::bail!("presence.ir_burst_frames must be at least 1");
+        }
+
+        if !(self.presence.min_confidence > 0.0 && self.presence.min_confidence <= 1.0) {
+            anyhow::bail!(
+                "presence.min_confidence must be in (0.0, 1.0], got {}",
+                self.presence.min_confidence
+            );
+        }
+
+        if self.motion.present_retry_after_miss_ms > self.motion.present_stillness_timeout_ms {
+            anyhow::bail!(
+                "motion.present_retry_after_miss_ms ({}) must not exceed \
+                 motion.present_stillness_timeout_ms ({}) — the retry cadence is meant \
+                 to be faster than the initial stillness timeout, not slower",
+                self.motion.present_retry_after_miss_ms,
+                self.motion.present_stillness_timeout_ms
+            );
+        }
+
+        Ok(())
     }
 
     pub fn default_path() -> PathBuf {

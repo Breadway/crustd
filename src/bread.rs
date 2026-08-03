@@ -1,10 +1,22 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::warn;
+
+/// Upper bound on connect + write + read for a single emit. Without this, a bread
+/// daemon that accepts the connection but then hangs (deadlocked module, blocked on
+/// its own IPC) would stall the presence loop forever, since none of these calls
+/// have a timeout of their own.
+const IPC_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Caps how much a single response line can grow before giving up — the peer is
+/// local and trusted, but there's no reason to let a misbehaving daemon that never
+/// sends a newline grow this buffer without bound.
+const MAX_RESPONSE_BYTES: u64 = 4096;
 
 /// Thin client for breadd's line-delimited JSON-RPC IPC socket. Connects fresh for
 /// each emit rather than holding a persistent connection — presence changes are rare
@@ -30,37 +42,57 @@ impl BreadClient {
 
     /// Emits `<event_prefix>.<suffix>` with the given JSON payload. Errors are logged
     /// and swallowed by the caller's choice — a missing/unreachable bread daemon
-    /// shouldn't crash the presence loop.
+    /// shouldn't crash the presence loop. Bounded by `IPC_TIMEOUT` end-to-end so a
+    /// daemon that accepts the connection but never responds can't hang the caller.
     pub async fn emit(&self, suffix: &str, data: serde_json::Value) -> Result<()> {
         let event = format!("{}.{}", self.event_prefix, suffix);
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .await
-            .with_context(|| format!("connecting to bread socket at {:?}", self.socket_path))?;
-
         let request = json!({
             "id": "crustd",
             "method": "emit",
             "params": { "event": event, "data": data },
         });
         let line = format!("{}\n", serde_json::to_string(&request)?);
+
+        let response = tokio::time::timeout(IPC_TIMEOUT, self.send_and_wait(&line))
+            .await
+            .context("bread emit timed out")??;
+
+        if !response_confirms_emitted(&response) {
+            warn!(response = %response.trim(), "bread did not confirm emit");
+        }
+
+        Ok(())
+    }
+
+    async fn send_and_wait(&self, line: &str) -> Result<String> {
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .await
+            .with_context(|| format!("connecting to bread socket at {:?}", self.socket_path))?;
+
         stream
             .write_all(line.as_bytes())
             .await
             .context("writing emit request")?;
 
-        let mut reader = BufReader::new(stream);
+        let mut reader = BufReader::new(stream.take(MAX_RESPONSE_BYTES));
         let mut response = String::new();
         reader
             .read_line(&mut response)
             .await
             .context("reading emit response")?;
 
-        if !response.contains("\"emitted\":true") {
-            warn!(response = %response.trim(), "bread did not confirm emit");
-        }
-
-        Ok(())
+        Ok(response)
     }
+}
+
+/// Parses the emit response as JSON and checks `emitted == true`, rather than doing
+/// a raw substring match — a differently-formatted (but still correct) response,
+/// e.g. with extra whitespace or reordered fields, shouldn't be misread as a failure.
+fn response_confirms_emitted(response: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(response)
+        .ok()
+        .and_then(|v| v.get("emitted").and_then(|e| e.as_bool()))
+        .unwrap_or(false)
 }
 
 fn default_socket_path() -> PathBuf {

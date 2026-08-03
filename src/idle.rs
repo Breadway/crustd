@@ -17,6 +17,7 @@ use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::ExtId
 /// wayland-client event loop is blocking.
 pub struct IdleWatcher {
     idle: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 }
 
 impl IdleWatcher {
@@ -25,19 +26,32 @@ impl IdleWatcher {
     /// signal" and fall back to the camera-only behavior rather than erroring out.
     pub fn spawn(timeout_ms: u32) -> Option<Self> {
         let idle = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
         let idle_for_thread = Arc::clone(&idle);
+        let alive_for_thread = Arc::clone(&alive);
         let (ready_tx, ready_rx) = mpsc::channel();
 
         std::thread::Builder::new()
             .name("crustd-idle-notify".into())
-            .spawn(move || run(timeout_ms, idle_for_thread, ready_tx))
+            .spawn(move || run(timeout_ms, idle_for_thread, alive_for_thread, ready_tx))
             .ok()?;
 
-        ready_rx.recv().ok()?.then_some(Self { idle })
+        ready_rx.recv().ok()?.then_some(Self { idle, alive })
     }
 
+    /// Whether the compositor last reported the seat as idle. Only meaningful while
+    /// [`Self::is_alive`] is `true` — once the watcher thread has exited, this value
+    /// is frozen at whatever it last was and must not be trusted either way.
     pub fn is_idle(&self) -> bool {
         self.idle.load(Ordering::Relaxed)
+    }
+
+    /// `false` once the compositor connection has dropped and the background thread
+    /// has exited. Callers must check this before trusting `is_idle() == false` as
+    /// proof of active input — otherwise a dead watcher whose last known state was
+    /// "not idle" permanently short-circuits the camera-based retention checks.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 }
 
@@ -45,7 +59,7 @@ struct State {
     idle: Arc<AtomicBool>,
 }
 
-fn run(timeout_ms: u32, idle: Arc<AtomicBool>, ready_tx: mpsc::Sender<bool>) {
+fn run(timeout_ms: u32, idle: Arc<AtomicBool>, alive: Arc<AtomicBool>, ready_tx: mpsc::Sender<bool>) {
     let Ok(conn) = Connection::connect_to_env() else {
         let _ = ready_tx.send(false);
         return;
@@ -72,8 +86,9 @@ fn run(timeout_ms: u32, idle: Arc<AtomicBool>, ready_tx: mpsc::Sender<bool>) {
 
     loop {
         if queue.blocking_dispatch(&mut state).is_err() {
-            // Compositor connection dropped; stick with the last known idle state
-            // rather than spinning a busy loop.
+            // Compositor connection dropped. Mark the watcher dead so callers stop
+            // trusting the frozen idle flag, rather than spinning a busy loop.
+            alive.store(false, Ordering::Relaxed);
             break;
         }
     }

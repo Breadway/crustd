@@ -20,6 +20,12 @@ use motion::MotionGate;
 use presence::{PresenceState, PresenceTracker};
 use vision::{Backend, FaceDetector};
 
+/// IR frames are captured at the face detector's native input size — nearest-
+/// neighbor resizing from anything larger only throws away detail, and the sensor
+/// doesn't need to match the RGB motion-gate resolution.
+const IR_CAPTURE_WIDTH: u32 = 320;
+const IR_CAPTURE_HEIGHT: u32 = 240;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -67,9 +73,16 @@ async fn main() -> Result<()> {
 
     // While present, RGB motion (typing, mouse, posture shifts) — or, when available,
     // the compositor directly reporting active input — is the retention signal that
-    // resets this clock. Only once things have been still for a while do we spend an
-    // IR burst to double-check someone's actually still there.
+    // resets this clock. It's also reset after every retention IR check (positive or
+    // negative) so the check cadence is measured from "time since we last looked",
+    // not "time since the room was last active" — otherwise, once stillness crosses
+    // the threshold once, it stays crossed and every following tick re-fires the check.
     let mut last_rgb_motion_at = Instant::now();
+
+    // Rate-limits IR bursts while Absent: without this, sustained non-face RGB
+    // motion (a TV, a pet, trees through a window) would open the IR camera and run
+    // inference on every single active-poll tick, forever.
+    let mut last_ir_burst_at: Option<Instant> = None;
 
     info!(
         rgb_device,
@@ -103,7 +116,11 @@ async fn main() -> Result<()> {
 
         if presence.state() == PresenceState::Present {
             if let Some(watcher) = &idle_watcher {
-                if !watcher.is_idle() {
+                // Only trust "not idle" as proof of activity while the watcher is
+                // still alive — a dead watcher's idle flag is frozen at its last
+                // value and must not be allowed to permanently disable the
+                // camera-based retention checks below.
+                if watcher.is_alive() && !watcher.is_idle() {
                     // Compositor confirms the seat has active input right now — that's
                     // sufficient proof of presence on its own. No camera opened at all.
                     last_rgb_motion_at = Instant::now();
@@ -115,9 +132,15 @@ async fn main() -> Result<()> {
         // Both states share the same cheap RGB capture from here — IR is never
         // touched just to decide whether to look.
         let rgb_device_owned = rgb_device.clone();
-        let capture = tokio::task::spawn_blocking(move || camera::grab_rgb_luma(&rgb_device_owned, 320, 180))
-            .await
-            .context("rgb capture task panicked");
+        let capture_task =
+            tokio::task::spawn_blocking(move || camera::grab_rgb_luma(&rgb_device_owned, 320, 180));
+        let capture = tokio::select! {
+            _ = &mut shutdown => {
+                info!("shutting down");
+                break;
+            }
+            res = capture_task => res.context("rgb capture task panicked"),
+        };
 
         let frame = match capture {
             Ok(Ok(frame)) => frame,
@@ -157,13 +180,30 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            match run_ir_check(&ir_device, &cfg.presence, &mut detector).await {
+            let ir_result = tokio::select! {
+                _ = &mut shutdown => {
+                    info!("shutting down");
+                    break;
+                }
+                res = run_ir_check(&ir_device, &cfg.presence, &mut detector) => res,
+            };
+
+            // Reset the reference clock now that a check has actually happened,
+            // regardless of outcome — otherwise `elapsed()` stays past `due_after` on
+            // every following tick and the cadence collapses to the poll interval
+            // instead of the slow/fast retry cadence above.
+            last_rgb_motion_at = Instant::now();
+
+            match ir_result {
                 Ok(result) => {
                     let face_seen = result.max_confidence >= cfg.presence.min_confidence;
-                    if face_seen {
-                        last_rgb_motion_at = Instant::now();
+                    tokio::select! {
+                        _ = &mut shutdown => {
+                            info!("shutting down");
+                            break;
+                        }
+                        _ = handle_observation(&mut presence, &bread, face_seen) => {}
                     }
-                    handle_observation(&mut presence, &bread, face_seen).await;
                 }
                 Err(err) => warn!(error = %err, "ir retention check failed"),
             }
@@ -176,15 +216,39 @@ async fn main() -> Result<()> {
         // as someone arriving. IR camera stays closed and dark the rest of the time.
         if motion.is_motion {
             idle_interval = cfg.motion.active_poll_ms;
-            match run_ir_check(&ir_device, &cfg.presence, &mut detector).await {
-                Ok(result) => {
-                    let face_seen = result.max_confidence >= cfg.presence.min_confidence;
-                    if face_seen {
-                        last_rgb_motion_at = Instant::now();
+
+            // Sustained non-face motion (a TV, a pet, trees through a window) would
+            // otherwise re-trigger a burst on every active-poll tick forever — cap
+            // how often a burst can actually fire while nothing is confirming a face.
+            let burst_due = last_ir_burst_at
+                .map(|at| at.elapsed() >= Duration::from_millis(cfg.motion.ir_burst_cooldown_ms))
+                .unwrap_or(true);
+
+            if burst_due {
+                last_ir_burst_at = Some(Instant::now());
+                let ir_result = tokio::select! {
+                    _ = &mut shutdown => {
+                        info!("shutting down");
+                        break;
                     }
-                    handle_observation(&mut presence, &bread, face_seen).await;
+                    res = run_ir_check(&ir_device, &cfg.presence, &mut detector) => res,
+                };
+                match ir_result {
+                    Ok(result) => {
+                        let face_seen = result.max_confidence >= cfg.presence.min_confidence;
+                        if face_seen {
+                            last_rgb_motion_at = Instant::now();
+                        }
+                        tokio::select! {
+                            _ = &mut shutdown => {
+                                info!("shutting down");
+                                break;
+                            }
+                            _ = handle_observation(&mut presence, &bread, face_seen) => {}
+                        }
+                    }
+                    Err(err) => warn!(error = %err, "ir burst check failed"),
                 }
-                Err(err) => warn!(error = %err, "ir burst check failed"),
             }
         } else {
             idle_interval = (idle_interval * 3 / 2).min(cfg.motion.max_idle_poll_ms);
@@ -196,7 +260,6 @@ async fn main() -> Result<()> {
 
 struct IrCheckResult {
     max_confidence: f32,
-    max_mean_luma: f32,
 }
 
 /// Opens the IR camera for exactly one short burst, runs the tier-1 detector over
@@ -205,26 +268,21 @@ async fn run_ir_check(ir_device: &str, cfg: &PresenceConfig, detector: &mut Face
     let device = ir_device.to_string();
     let burst_frames = cfg.ir_burst_frames;
 
-    let frames = tokio::task::spawn_blocking(move || camera::grab_ir_burst(&device, burst_frames))
-        .await
-        .context("ir capture task panicked")??;
+    let frames = tokio::task::spawn_blocking(move || {
+        camera::grab_ir_burst(&device, IR_CAPTURE_WIDTH, IR_CAPTURE_HEIGHT, burst_frames)
+    })
+    .await
+    .context("ir capture task panicked")??;
 
     let mut max_confidence = 0.0f32;
-    let mut max_mean_luma = 0.0f32;
     for frame in &frames {
         let confidence = detector.max_face_confidence(frame)?;
         max_confidence = max_confidence.max(confidence);
-        max_mean_luma = max_mean_luma.max(frame.mean_luma());
     }
 
-    tracing::debug!(
-        max_confidence,
-        max_mean_luma,
-        threshold = cfg.min_confidence,
-        "ir burst result"
-    );
+    tracing::debug!(max_confidence, threshold = cfg.min_confidence, "ir burst result");
 
-    Ok(IrCheckResult { max_confidence, max_mean_luma })
+    Ok(IrCheckResult { max_confidence })
 }
 
 async fn handle_observation(presence: &mut PresenceTracker, bread: &BreadClient, positive: bool) {

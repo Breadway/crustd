@@ -66,13 +66,28 @@ impl FaceDetector {
             .run(ort::inputs!["input" => input])
             .map_err(|e| anyhow::anyhow!("running face detector session: {e}"))?;
 
-        let scores = outputs["scores"]
+        // Indexing outputs by name (`outputs["scores"]`) panics if the loaded model
+        // doesn't have an output by that name — a real possibility since the model
+        // path is user/config-controlled. Look it up fallibly instead so a
+        // mismatched model produces a normal error the caller can log and recover
+        // from, rather than aborting the whole daemon.
+        let scores_value = outputs
+            .get("scores")
+            .ok_or_else(|| anyhow::anyhow!("face detector model has no \"scores\" output"))?;
+
+        let (shape, data) = scores_value
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow::anyhow!("extracting scores output: {e}"))?;
 
-        // scores is [1, N, 2]: column 0 = background prob, column 1 = face prob.
+        // scores is expected to be [1, N, 2]: column 0 = background prob, column 1 =
+        // face prob. Verify the layout before treating pair[1] as the face score —
+        // a differently-shaped export (e.g. channel-first [1, 2, N]) would otherwise
+        // silently read the wrong values with no error.
+        if shape.len() != 3 || shape[0] != 1 || shape[2] != 2 {
+            anyhow::bail!("face detector model output has unexpected shape {shape:?}, expected [1, N, 2]");
+        }
+
         // The exported graph already applies softmax, so these are usable directly.
-        let (_shape, data) = scores;
         let max_face_prob = data
             .chunks_exact(2)
             .map(|pair| pair[1])
