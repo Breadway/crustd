@@ -98,7 +98,7 @@ pub fn resolve_device(configured: &str, want: DeviceKind) -> Result<PathBuf> {
 /// Opens the device, captures, and drops it before returning — nothing about this
 /// camera is left streaming between polls.
 pub fn grab_rgb_luma(device: &str, width: u32, height: u32) -> Result<GrayFrame> {
-    let mut dev = v4l::Device::with_path(device)
+    let dev = v4l::Device::with_path(device)
         .with_context(|| format!("opening rgb camera {device}"))?;
 
     let requested_fourcc = FourCC::new(b"YUYV");
@@ -124,7 +124,7 @@ pub fn grab_rgb_luma(device: &str, width: u32, height: u32) -> Result<GrayFrame>
         );
     }
 
-    let mut stream = MmapStream::with_buffers(&mut dev, Type::VideoCapture, 2)
+    let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 2)
         .context("starting rgb capture stream")?;
     stream.set_timeout(CAPTURE_TIMEOUT);
 
@@ -166,7 +166,7 @@ pub fn grab_rgb_luma(device: &str, width: u32, height: u32) -> Result<GrayFrame>
 /// callers must not hold the IR camera open outside of this function, since that's
 /// what keeps the IR illuminator from flashing continuously.
 pub fn grab_ir_burst(device: &str, width: u32, height: u32, count: u32) -> Result<Vec<GrayFrame>> {
-    let mut dev =
+    let dev =
         v4l::Device::with_path(device).with_context(|| format!("opening ir camera {device}"))?;
 
     // V4L2 format is persistent device state — without explicitly setting it here,
@@ -191,7 +191,7 @@ pub fn grab_ir_burst(device: &str, width: u32, height: u32, count: u32) -> Resul
         );
     }
 
-    let mut stream = MmapStream::with_buffers(&mut dev, Type::VideoCapture, 2)
+    let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 2)
         .context("starting ir capture stream")?;
     stream.set_timeout(CAPTURE_TIMEOUT);
 

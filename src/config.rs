@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub camera: CameraConfig,
@@ -144,17 +144,6 @@ impl Default for BreadConfig {
         Self {
             socket_path: String::new(),
             event_prefix: "bread.presence".to_string(),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            camera: CameraConfig::default(),
-            motion: MotionConfig::default(),
-            presence: PresenceConfig::default(),
-            bread: BreadConfig::default(),
         }
     }
 }
