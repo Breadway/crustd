@@ -1,0 +1,65 @@
+# crustd configuration template.
+#
+# bakery installs this file as ~/.config/crustd/crustd.example.toml (or
+# $prefix/share/... on a system install). crustd reads ~/.config/crustd/crustd.toml;
+# copy this file there and edit the copy. Every key below is optional: an empty or
+# missing crustd.toml runs with exactly these defaults.
+#
+# The presence tier needs the UltraFace-RFB-320 ONNX model. Place it at the path in
+# [presence] face_detect_model, or run models/fetch.sh from the repo, which downloads
+# it, checks its sha256 and installs it to that location. crustd exits at startup if
+# the model is missing.
+
+[camera]
+# "auto:rgb" and "auto:ir" resolve the devices by capture capability through
+# /dev/v4l/by-path at startup. Set a literal /dev/videoN to pin one device.
+# The always-on motion gate uses rgb_device and never opens the IR emitter;
+# ir_device is opened only for short face-detection bursts.
+rgb_device = "auto:rgb"
+ir_device = "auto:ir"
+
+[motion]
+# Tiering. The RGB motion gate is cheap and runs continuously; these intervals
+# decide how often it looks and when an IR burst is worth the power.
+idle_poll_ms = 2000                    # poll interval when nothing has moved recently
+active_poll_ms = 250                   # poll interval just after motion was seen
+max_idle_poll_ms = 15000               # backoff ceiling when the room has been still a while
+present_poll_ms = 1000                 # RGB retention poll while presence is confirmed
+present_stillness_timeout_ms = 45000   # continuous RGB stillness before an IR retention check
+present_retry_after_miss_ms = 8000     # retry cadence after a missed retention check
+input_idle_timeout_ms = 20000          # compositor seat idle time before camera retention is used at all
+diff_threshold = 24                    # per-pixel luma delta (0-255) that counts as changed
+blob_min_pixels = 200                  # changed pixels (of 320x180) that count as motion
+ir_burst_cooldown_ms = 3000            # floor between IR bursts while unresolved motion continues
+
+[presence]
+# Path to the face-detection model. ~ is expanded against $HOME.
+face_detect_model = "~/.local/share/crustd/models/ultraface-rfb-320.onnx"
+confirm_frames = 2                     # consecutive positive IR bursts before presence turns on
+release_frames = 3                     # consecutive negative IR bursts before presence turns off
+min_confidence = 0.7                   # detector confidence floor, exclusive of 0.0
+ir_burst_frames = 3                    # frames grabbed per IR burst, voted before deciding
+retention_grace_misses = 2             # retention misses before the fast recheck cadence starts
+
+[bread]
+# Empty socket_path resolves $XDG_RUNTIME_DIR/bread/breadd.sock, matching breadd.
+socket_path = ""
+event_prefix = "bread.presence"
+
+[emitter]
+# UVC extension-unit control that powers the IR illuminator. The defaults are the
+# values probed on this laptop's 30c9:00ee RGB+IR module: unit 14, selector 6,
+# ON = 01 03 02 00 00 00 00 00 00, OFF = 01 03 01 00 00 00 00 00 00. They are
+# written before the IR stream opens, because the driver latches the control at
+# stream start. A camera without the control, or a failed write, only logs a
+# warning and leaves the burst dark.
+#
+# device = "" means "use the IR camera node from [camera] ir_device".
+# on_value = [] disables the ON write entirely; off_value = [] leaves the control
+# as-is after the burst (the driver resets it when the device closes).
+device = ""
+unit = 14
+selector = 6
+on_value = [0x01, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+off_value = [0x01, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+enable = true
