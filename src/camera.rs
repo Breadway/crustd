@@ -8,6 +8,8 @@ use v4l::io::traits::CaptureStream;
 use v4l::video::Capture;
 use v4l::FourCC;
 
+use crate::config::EmitterConfig;
+
 /// Upper bound on how long a single `stream.next()` call may block waiting for a
 /// frame. Without this, a wedged or contended device (another process holding the
 /// sensor, a stalled UVC controller) blocks the calling thread forever — since
@@ -160,12 +162,92 @@ pub fn grab_rgb_luma(device: &str, width: u32, height: u32) -> Result<GrayFrame>
     })
 }
 
+/// UVC request code from <linux/usb/video.h>: bRequest for UVC_SET_CUR.
+const UVC_SET_CUR: u8 = 0x01;
+
+/// `struct uvc_xu_control_query` from <linux/uvcvideo.h>, in the layout the C
+/// compiler emits on this target (repr(C): unit@0, selector@1, query@2, size@4,
+/// data@8; 16 bytes - confirmed against the kernel header by the irprobe tool
+/// that discovered the emitter control).
+#[repr(C)]
+struct UvcXuControlQuery {
+    unit: u8,
+    selector: u8,
+    query: u8,
+    size: u16,
+    data: *mut u8,
+}
+
+/// UVCIOC_CTRL_QUERY from <linux/uvcvideo.h>: _IOWR('u', 0x21,
+/// struct uvc_xu_control_query). Written out for the _IOC form of asm-generic/
+/// ioctl.h: nr at bit 0, type at bit 8, size at bit 16, direction bits at bit
+/// 30 (READ|WRITE = 3); 'u' = 0x75, size = 16 on x86_64 (matches the
+/// 0xc0107521 the irprobe tool prints for this machine).
+const UVCIOC_CTRL_QUERY: u64 =
+    (3 << 30) | (0x75 << 8) | 0x21 | ((std::mem::size_of::<UvcXuControlQuery>() as u64) << 16);
+
+extern "C" {
+    fn ioctl(fd: i32, request: u64, arg: *mut UvcXuControlQuery) -> i32;
+}
+
+/// Low-level write of `value` to the emitter control on the device with fd
+/// `fd`, via UVCIOC_CTRL_QUERY / UVC_SET_CUR. Returns the ioctl result.
+fn xu_set_emitter_value(fd: i32, emitter: &EmitterConfig, value: &[u8]) -> std::io::Result<()> {
+    let mut query = UvcXuControlQuery {
+        unit: emitter.unit,
+        selector: emitter.selector,
+        query: UVC_SET_CUR,
+        size: value.len() as u16,
+        data: value.as_ptr() as *mut u8,
+    };
+    let rc = unsafe { ioctl(fd, UVCIOC_CTRL_QUERY, &mut query) };
+    if rc != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Writes `value` to the emitter's extension-unit control. On the 30c9:00ee
+/// module the control lives on the IR node where the burst runs, so with
+/// `emitter.device` empty the burst's own device is used; a configured
+/// `emitter.device` opens that node instead. Returns the ioctl result (Err on
+/// open or write failure; callers log and carry on).
+fn ir_emitter_write(
+    dev: &v4l::Device,
+    emitter: &EmitterConfig,
+    value: &[u8],
+) -> std::io::Result<()> {
+    if emitter.device.is_empty() {
+        xu_set_emitter_value(dev.handle().fd(), emitter, value)
+    } else {
+        match v4l::Device::with_path(&emitter.device) {
+            Ok(emitter_dev) => xu_set_emitter_value(emitter_dev.handle().fd(), emitter, value),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 /// Grabs `count` frames from the IR camera in a single short burst and returns them.
 ///
-/// The device is opened once for the whole burst and dropped immediately after —
-/// callers must not hold the IR camera open outside of this function, since that's
-/// what keeps the IR illuminator from flashing continuously.
-pub fn grab_ir_burst(device: &str, width: u32, height: u32, count: u32) -> Result<Vec<GrayFrame>> {
+/// The device is opened once for the whole burst and dropped immediately after.
+/// Callers must not hold the IR camera open outside of this function, since
+/// that's what keeps the IR illuminator from flashing continuously.
+///
+/// When `emitter` is enabled, its ON value is written to the extension-unit
+/// control while the device is open and the stream is not yet running - the
+/// driver latches the value at stream start, so writing earlier (or later)
+/// leaves the camera dark during the burst - and the OFF value is written after
+/// the stream closes. Both writes are best-effort: a camera without an emitter
+/// control at this unit/selector, or where the write fails, still gets a valid
+/// (dark) burst - log a warning and continue, never fail.
+pub fn grab_ir_burst(
+    device: &str,
+    width: u32,
+    height: u32,
+    count: u32,
+    emitter: &EmitterConfig,
+) -> Result<Vec<GrayFrame>> {
     let dev =
         v4l::Device::with_path(device).with_context(|| format!("opening ir camera {device}"))?;
 
@@ -182,13 +264,52 @@ pub fn grab_ir_burst(device: &str, width: u32, height: u32, count: u32) -> Resul
     let fmt = Capture::format(&dev).context("reading confirmed ir format")?;
 
     if fmt.fourcc != requested_fourcc || fmt.width != width || fmt.height != height {
-        anyhow::bail!(
-            "ir camera {device} does not support {width}x{height} {requested_fourcc}; \
-             driver reported {}x{} {} instead",
-            fmt.width,
-            fmt.height,
-            fmt.fourcc
+        if fmt.fourcc != requested_fourcc {
+            anyhow::bail!(
+                "ir camera {device} does not support {width}x{height} {requested_fourcc}; \
+                 driver reported {}x{} {} instead",
+                fmt.width,
+                fmt.height,
+                fmt.fourcc
+            );
+        }
+        // Same pixel format, different size: the 30c9:00ee module supports
+        // only 640x360 GREY while the presence defaults ask for 320x240. The
+        // detector resizes to its own input size anyway (vision::preprocess),
+        // so capture at whatever the driver actually supports instead of
+        // failing every burst.
+        tracing::debug!(
+            device,
+            requested_w = width,
+            requested_h = height,
+            got_w = fmt.width,
+            got_h = fmt.height,
+            "ir camera substituted a different frame size; using it"
         );
+    }
+
+    // Switch the emitter on before the stream opens: the driver latches the
+    // control value at stream start, so this write is what makes the burst see
+    // light. Best-effort - a camera without an emitter control at this
+    // unit/selector, or where the write fails, still gets a valid (dark) burst:
+    // warn and carry on.
+    if emitter.enable && !emitter.on_value.is_empty() {
+        if let Err(err) = ir_emitter_write(&dev, emitter, &emitter.on_value) {
+            tracing::warn!(
+                device,
+                unit = emitter.unit,
+                selector = emitter.selector,
+                error = %err,
+                "ir emitter on-write failed"
+            );
+        } else {
+            tracing::debug!(
+                device,
+                unit = emitter.unit,
+                selector = emitter.selector,
+                "ir emitter armed before stream start"
+            );
+        }
     }
 
     let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 2)
@@ -216,6 +337,22 @@ pub fn grab_ir_burst(device: &str, width: u32, height: u32, count: u32) -> Resul
             height: fmt.height,
             luma: buf[..expected].to_vec(),
         });
+    }
+
+    // The burst is closed: stop the stream before switching the emitter off so
+    // the write isn't racing the stream-start latch. Same best-effort
+    // semantics as the write above.
+    drop(stream);
+    if emitter.enable && !emitter.off_value.is_empty() {
+        if let Err(err) = ir_emitter_write(&dev, emitter, &emitter.off_value) {
+            tracing::warn!(
+                device,
+                unit = emitter.unit,
+                selector = emitter.selector,
+                error = %err,
+                "ir emitter off-write failed"
+            );
+        }
     }
 
     Ok(frames)

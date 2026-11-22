@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use bread::BreadClient;
 use camera::DeviceKind;
-use config::{Config, PresenceConfig};
+use config::{Config, EmitterConfig, PresenceConfig};
 use idle::IdleWatcher;
 use motion::MotionGate;
 use presence::{PresenceState, PresenceTracker};
@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
                     info!("shutting down");
                     break;
                 }
-                res = run_ir_check(&ir_device, &cfg.presence, &mut detector) => res,
+                res = run_ir_check(&ir_device, &cfg.presence, &cfg.emitter, &mut detector) => res,
             };
 
             // Reset the reference clock now that a check has actually happened,
@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
                         info!("shutting down");
                         break;
                     }
-                    res = run_ir_check(&ir_device, &cfg.presence, &mut detector) => res,
+                    res = run_ir_check(&ir_device, &cfg.presence, &cfg.emitter, &mut detector) => res,
                 };
                 match ir_result {
                     Ok(result) => {
@@ -262,14 +262,21 @@ struct IrCheckResult {
     max_confidence: f32,
 }
 
-/// Opens the IR camera for exactly one short burst, runs the tier-1 detector over
-/// each frame, and closes it again before returning.
-async fn run_ir_check(ir_device: &str, cfg: &PresenceConfig, detector: &mut FaceDetector) -> Result<IrCheckResult> {
+/// Opens the IR camera for exactly one short burst (arming the IR emitter first,
+/// per `camera::grab_ir_burst`), runs the tier-1 detector over each frame, and
+/// closes the camera again before returning.
+async fn run_ir_check(
+    ir_device: &str,
+    cfg: &PresenceConfig,
+    emitter: &EmitterConfig,
+    detector: &mut FaceDetector,
+) -> Result<IrCheckResult> {
     let device = ir_device.to_string();
     let burst_frames = cfg.ir_burst_frames;
+    let emitter = emitter.clone();
 
     let frames = tokio::task::spawn_blocking(move || {
-        camera::grab_ir_burst(&device, IR_CAPTURE_WIDTH, IR_CAPTURE_HEIGHT, burst_frames)
+        camera::grab_ir_burst(&device, IR_CAPTURE_WIDTH, IR_CAPTURE_HEIGHT, burst_frames, &emitter)
     })
     .await
     .context("ir capture task panicked")??;
