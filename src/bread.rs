@@ -88,14 +88,65 @@ impl BreadClient {
 /// Parses the emit response as JSON and checks `emitted == true`, rather than doing
 /// a raw substring match — a differently-formatted (but still correct) response,
 /// e.g. with extra whitespace or reordered fields, shouldn't be misread as a failure.
+///
+/// breadd wraps the acknowledgement as `{"id": ..., "result": {"emitted": true}}`,
+/// so the flag is read from `result` first and from the top level second. The flat
+/// form is kept for older breadd builds; without the nested lookup every successful
+/// emit was logged as "bread did not confirm emit" (CRUST-1).
 fn response_confirms_emitted(response: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(response)
-        .ok()
-        .and_then(|v| v.get("emitted").and_then(|e| e.as_bool()))
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(response) else {
+        return false;
+    };
+    value
+        .get("result")
+        .and_then(|result| result.get("emitted"))
+        .or_else(|| value.get("emitted"))
+        .and_then(|emitted| emitted.as_bool())
         .unwrap_or(false)
 }
 
 fn default_socket_path() -> PathBuf {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(runtime_dir).join("bread").join("breadd.sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_confirms_emitted;
+
+    /// The exact reply breadd sent on hermes, captured in the journal.
+    #[test]
+    fn nested_result_shape_is_confirmed() {
+        assert!(response_confirms_emitted(
+            r#"{"id":"crustd","result":{"emitted":true}}"#
+        ));
+    }
+
+    #[test]
+    fn flat_shape_still_works() {
+        assert!(response_confirms_emitted(r#"{"emitted":true}"#));
+    }
+
+    #[test]
+    fn reordered_fields_and_whitespace_are_confirmed() {
+        assert!(response_confirms_emitted(
+            r#"{
+  "result" : {
+    "emitted" : true
+  },
+  "id": "crustd"
+}"#
+        ));
+    }
+
+    #[test]
+    fn false_malformed_and_wrong_type_are_not_confirmed() {
+        assert!(!response_confirms_emitted(
+            r#"{"id":"crustd","result":{"emitted":false}}"#
+        ));
+        assert!(!response_confirms_emitted(r#"{"emitted":false}"#));
+        assert!(!response_confirms_emitted(r#"{"emitted":"true"}"#));
+        assert!(!response_confirms_emitted(""));
+        assert!(!response_confirms_emitted("not json"));
+    }
 }
