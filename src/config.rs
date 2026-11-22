@@ -10,6 +10,7 @@ pub struct Config {
     pub motion: MotionConfig,
     pub presence: PresenceConfig,
     pub bread: BreadConfig,
+    pub emitter: EmitterConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -28,6 +29,53 @@ impl Default for CameraConfig {
             // see camera::resolve_device. Set to a literal /dev/videoN to override.
             rgb_device: "auto:rgb".to_string(),
             ir_device: "auto:ir".to_string(),
+        }
+    }
+}
+
+/// UVC extension-unit control that switches the IR emitter of the IR camera on.
+/// Some Luxvisions hybrid RGB+IR modules ship a separate IR illuminator that
+/// uvcvideo never powers up on its own; writing the ON value to this control
+/// (before the IR stream opens - the driver latches the value at stream start)
+/// makes it strobe. Defaults are the values discovered on this laptop's module
+/// by probing its extension units, so an existing crustd.toml without an
+/// [emitter] section still works. On a camera without this control, or where
+/// the write fails, the write is skipped or logged as a warning and the burst
+/// stays dark - never fatal.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EmitterConfig {
+    /// Device node that owns the emitter control. Empty = the IR camera node
+    /// from [camera] ir_device.
+    pub device: String,
+    /// UVC extension unit id of the emitter control.
+    pub unit: u8,
+    /// UVC control selector of the emitter control.
+    pub selector: u8,
+    /// Value bytes written to the control to switch the emitter on. Empty =
+    /// skip the write entirely.
+    pub on_value: Vec<u8>,
+    /// Value bytes written to the control after each burst closes. Empty =
+    /// leave the control as-is (the driver resets it when the device closes).
+    pub off_value: Vec<u8>,
+    /// Master switch for the emitter writes.
+    pub enable: bool,
+}
+
+impl Default for EmitterConfig {
+    fn default() -> Self {
+        Self {
+            device: String::new(),
+            // Discovered by probing /dev/video2's extension units on the
+            // 30c9:00ee module: UVC unit 14, selector 6. ON = 01 03 02 00 00
+            // 00 00 00 00 (byte 2 = 0x02 means on, per the status readback in
+            // the reference emitter tools); OFF = 01 03 01 00 00 00 00 00 00.
+            // The other units on this module (10, 13) are unrelated controls.
+            unit: 14,
+            selector: 6,
+            on_value: vec![0x01, 0x03, 0x02, 0, 0, 0, 0, 0, 0],
+            off_value: vec![0x01, 0x03, 0x01, 0, 0, 0, 0, 0, 0],
+            enable: true,
         }
     }
 }
