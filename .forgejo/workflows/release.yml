@@ -1,0 +1,78 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    if: ${{ !contains(github.ref_name, '-rc.') }}
+    runs-on: [self-hosted]
+    steps:
+      - name: checkout
+        run: |
+          set -euo pipefail
+          rm -rf src && mkdir src
+          git clone --branch "${GITHUB_REF_NAME}" --depth 1 \
+            "https://git.breadway.dev/${GITHUB_REPOSITORY}.git" src
+
+      # crustd has no ci/build.sh wrapper yet, so this is a plain locked build.
+      # Same reason as the other products: never drop --locked.
+      - name: build
+        run: |
+          set -euo pipefail
+          cd src && cargo build --release --locked || {
+            echo "::error::cargo build --release --locked failed. If Cargo.lock drifted, update and commit it; do not drop --locked."
+            exit 1
+          }
+
+      - name: test
+        run: cd src && cargo test --release --locked
+
+      - name: prepare artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG_DIR="/srv/breadway-dl/crustd/${VERSION}"
+          mkdir -p "${PKG_DIR}"
+          cp src/target/release/crustd "${PKG_DIR}/crustd-x86_64"
+          strip "${PKG_DIR}/crustd-x86_64"
+          sha256sum "${PKG_DIR}/crustd-x86_64" | awk '{print $1}' \
+            > "${PKG_DIR}/crustd-x86_64.sha256"
+          cp src/packaging/systemd/crustd.service "${PKG_DIR}/"
+          cp src/crustd.example.toml "${PKG_DIR}/"
+          cp src/LICENSE "${PKG_DIR}/"
+          cp src/bakery.toml "${PKG_DIR}/bakery.toml"
+          ln -sfn "${VERSION}" "/srv/breadway-dl/crustd/latest"
+
+      - name: regenerate index.json
+        env:
+          MINISIGN_SEC_KEY: ${{ secrets.BAKERY_MINISIGN_SEC_KEY_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SEC_KEY:-}" ]; then
+            echo "::error::BAKERY_MINISIGN_SEC_KEY_PATH secret not set; refusing to regenerate index.json unsigned (would leave a stale signature mismatched against fresh content and break bakery for everyone)"
+            exit 1
+          fi
+          ECOSYSTEM_CI_DIR="$(mktemp -d /tmp/bread-ecosystem-crustd-release-XXXXXX)"
+          git clone https://git.breadway.dev/Breadway/bread-ecosystem.git "${ECOSYSTEM_CI_DIR}"
+          bash "${ECOSYSTEM_CI_DIR}/scripts/gen-index.sh"
+          rm -rf "${ECOSYSTEM_CI_DIR}"
+
+      - name: upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::GH_RELEASE_TOKEN is not set on Breadway/crustd; dl.breadway.dev is authoritative, skipping the GitHub release mirror"
+            exit 0
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG_DIR="/srv/breadway-dl/crustd/${VERSION}"
+          gh release create "${GITHUB_REF_NAME}" --repo Breadway/crustd \
+            --title "crustd v${VERSION}" --generate-notes 2>/dev/null || true
+          gh release upload "${GITHUB_REF_NAME}" --repo Breadway/crustd \
+            "${PKG_DIR}/crustd-x86_64" \
+            "${PKG_DIR}/crustd-x86_64.sha256" \
+            --clobber

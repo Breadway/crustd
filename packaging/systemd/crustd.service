@@ -5,7 +5,11 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/crustd
+# bakery rewrites this path to its active bin dir at install time (the basename
+# is preserved and the args keep working), so ~/.local/bin on a user install and
+# /usr/local/bin under the BOS system prefix. /usr/local/bin is the shipped
+# default because that is the system-prefix bakery path.
+ExecStart=/usr/local/bin/crustd
 Restart=on-failure
 RestartSec=5
 
@@ -14,7 +18,11 @@ PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=%h/.local/share/crustd %h/.config/crustd
 NoNewPrivileges=true
-SupplementaryGroups=video
+# No SupplementaryGroups=video here: a systemd *user* manager runs without
+# CAP_SETGID, so the directive fails the unit with 216/GROUP instead of adding
+# the group. The service runs inside the graphical session and inherits that
+# session's groups, which already include video. See INFRA-128 for the same
+# failure on another user unit.
 DevicePolicy=closed
 DeviceAllow=char-video4linux rw
 PrivateNetwork=true

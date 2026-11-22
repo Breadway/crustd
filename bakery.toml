@@ -1,0 +1,28 @@
+name = "crustd"
+description = "Tiered, power-efficient presence detection daemon for Bread"
+binaries = ["crustd"]
+# ldd target/release/crustd on the build host: libstdc++.so.6, libgcc_s.so.1,
+# libm.so.6, libc.so.6. glibc is always present; gcc-libs is the only
+# non-glibc package in that list. onnxruntime is linked statically (no
+# libonnxruntime.so in target/release and no DT_NEEDED entry), so it is not a
+# system dependency. wayland-client loads libwayland through dlopen.
+system_deps = ["gcc-libs"]
+optional_system_deps = []
+# breadd is what consumes bread.presence.*, but crustd starts without it and
+# logs a warning per failed emit, so bread is not a hard bakery dependency.
+# Same pattern as breadcast.
+bread_deps = []
+license_file = "LICENSE"
+
+[[service]]
+unit = "crustd.service"
+enable = true
+
+[config]
+dir = "~/.config/crustd"
+example = "crustd.example.toml"
+
+[install]
+post_install = [
+    "systemctl --user is-active --quiet crustd || systemctl --user start crustd",
+]
