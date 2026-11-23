@@ -1,4 +1,4 @@
-# crustd: bread event integration
+# crust: bread event integration
 
 crustd is a standalone presence-detection daemon: it works exactly the same
 with or without `breadd` running. When breadd *is* present, a debounced
