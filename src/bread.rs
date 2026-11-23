@@ -49,7 +49,7 @@ impl BreadClient {
         let request = json!({
             "id": "crustd",
             "method": "emit",
-            "params": { "event": event, "data": data },
+            "params": { "source": "crust", "kind": event, "data": data },
         });
         let line = format!("{}\n", serde_json::to_string(&request)?);
 
