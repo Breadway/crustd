@@ -44,7 +44,7 @@ retention_grace_misses = 2             # retention misses before the fast rechec
 [bread]
 # Empty socket_path resolves $XDG_RUNTIME_DIR/bread/breadd.sock, matching breadd.
 socket_path = ""
-event_prefix = "bread.presence"
+event_prefix = "bread.crust"
 
 [emitter]
 # UVC extension-unit control that powers the IR illuminator. The defaults are the

@@ -8,7 +8,7 @@ binaries = ["crustd"]
 # system dependency. wayland-client loads libwayland through dlopen.
 system_deps = ["gcc-libs"]
 optional_system_deps = []
-# breadd is what consumes bread.presence.*, but crustd starts without it and
+# breadd is what consumes bread.crust.*, but crustd starts without it and
 # logs a warning per failed emit, so bread is not a hard bakery dependency.
 # Same pattern as breadcast.
 bread_deps = []
