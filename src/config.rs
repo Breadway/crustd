@@ -184,6 +184,7 @@ impl Default for PresenceConfig {
 pub struct BreadConfig {
     /// Empty = resolve $XDG_RUNTIME_DIR/bread/breadd.sock at runtime, matching breadd's default.
     pub socket_path: String,
+    /// Must stay inside crustd's registered `bread.crust.*` namespace.
     pub event_prefix: String,
 }
 
@@ -191,7 +192,7 @@ impl Default for BreadConfig {
     fn default() -> Self {
         Self {
             socket_path: String::new(),
-            event_prefix: "bread.presence".to_string(),
+            event_prefix: "bread.crust".to_string(),
         }
     }
 }
@@ -221,9 +222,18 @@ impl Config {
             ("motion.active_poll_ms", self.motion.active_poll_ms),
             ("motion.max_idle_poll_ms", self.motion.max_idle_poll_ms),
             ("motion.present_poll_ms", self.motion.present_poll_ms),
-            ("motion.present_stillness_timeout_ms", self.motion.present_stillness_timeout_ms),
-            ("motion.present_retry_after_miss_ms", self.motion.present_retry_after_miss_ms),
-            ("motion.ir_burst_cooldown_ms", self.motion.ir_burst_cooldown_ms),
+            (
+                "motion.present_stillness_timeout_ms",
+                self.motion.present_stillness_timeout_ms,
+            ),
+            (
+                "motion.present_retry_after_miss_ms",
+                self.motion.present_retry_after_miss_ms,
+            ),
+            (
+                "motion.ir_burst_cooldown_ms",
+                self.motion.ir_burst_cooldown_ms,
+            ),
         ];
         for (name, value) in polls {
             if value < MIN_POLL_MS {
@@ -249,6 +259,13 @@ impl Config {
                  to be faster than the initial stillness timeout, not slower",
                 self.motion.present_retry_after_miss_ms,
                 self.motion.present_stillness_timeout_ms
+            );
+        }
+
+        let prefix = &self.bread.event_prefix;
+        if !(prefix == "bread.crust" || prefix.starts_with("bread.crust.")) {
+            anyhow::bail!(
+                "bread.event_prefix must be bread.crust or a bread.crust.* namespace, got {prefix}"
             );
         }
 
